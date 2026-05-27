@@ -151,7 +151,7 @@ jobs:
             git clone https://github.com/containers/bubblewrap /src
             cd /src
             git checkout "$(git describe --tags --abbrev=0)"   # pin to latest release tag (reproducible, avoids main breakage)
-            meson setup _b --buildtype=release -Dselinux=disabled --prefer-static -Dc_link_args=-static
+            meson setup _b --buildtype=release -Dselinux=disabled -Dtests=false --prefer-static -Dc_link_args=-static
             ninja -C _b
             cp _b/bwrap /out/bwrap && chmod +x /out/bwrap
             /out/bwrap --version
