@@ -146,10 +146,11 @@ jobs:
         run: |
           mkdir -p out
           docker run --rm -v "$PWD/out:/out" alpine:latest sh -c '
-            set -e
+            set -ex
             apk add --no-cache build-base meson ninja git libcap-dev libcap-static linux-headers
-            git clone --depth 1 https://github.com/containers/bubblewrap /src
+            git clone https://github.com/containers/bubblewrap /src
             cd /src
+            git checkout "$(git describe --tags --abbrev=0)"   # pin to latest release tag (reproducible, avoids main breakage)
             meson setup _b --buildtype=release -Dselinux=disabled --prefer-static -Dc_link_args=-static
             ninja -C _b
             cp _b/bwrap /out/bwrap && chmod +x /out/bwrap
