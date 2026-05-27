@@ -1,0 +1,157 @@
+# Builds the per-OS agent sandbox bins ONCE and publishes them as release assets (+ a SHA256SUMS the
+# consumer verifies), so VDG_CleanCode's per-OS release downloads + copies them instead of compiling the
+# codex Rust sandbox fresh every build (the cold ~30-60min cargo build in release.ps1's tag-worktree,
+# which has no persistent cargo cache). Only win + mac are produced here — those are the only CleanCode
+# builds that compile Rust; the linux build is already Rust-free. The bins LINK vendored codex Rust
+# (Apache-2.0) — the codex LICENSE + NOTICE ship beside them.
+name: build-sandbox
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, no leading v (e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: write   # create the release + upload assets on THIS repo via the built-in GITHUB_TOKEN
+
+concurrency:
+  group: build-sandbox-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Windows: our thin-bin (RestrictedToken/WFP, reuses codex run_windows_sandbox_capture) + codex's own
+  # elevated setup + command-runner bins (the --elevated path locates them next to the thin-bin). Native
+  # build only — Win32/WFP can't cross-compile. windows-latest ships the msvc Rust toolchain via rustup.
+  win:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust toolchain (windows-msvc)
+        shell: bash
+        run: rustup default stable-msvc && rustc --version && cargo --version
+
+      # Persist the cargo registry/git + the crate target across runs (incremental — cold once, then
+      # warm). Keyed on the crate's vendored Cargo.lock so a dep bump busts it.
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/native/windows-restricted-spawn/target
+          key: cargo-win-${{ hashFiles('src/native/windows-restricted-spawn/Cargo.lock') }}
+          restore-keys: cargo-win-
+
+      - name: Build win sandbox bins
+        shell: bash
+        run: |
+          M=src/native/windows-restricted-spawn/Cargo.toml
+          cargo build --release --manifest-path "$M"
+          cargo build --release --manifest-path "$M" -p codex-windows-sandbox --bin codex-windows-sandbox-setup --bin codex-command-runner
+
+      - name: Stage bins
+        shell: bash
+        run: |
+          mkdir -p out
+          T=src/native/windows-restricted-spawn/target/release
+          for b in vdg-windows-restricted-spawn.exe codex-windows-sandbox-setup.exe codex-command-runner.exe; do
+            test -f "$T/$b" || { echo "MISSING $b"; exit 1; }
+            cp "$T/$b" "out/$b"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins-win
+          path: out/*
+
+  # macOS: single universal (arm64 + x64) seatbelt thin-bin. The enforcer is the system /usr/bin/sandbox-exec
+  # — no extra codex bin to bundle; codex's seatbelt logic is linked in via codex-sandboxing. cargo
+  # apple-darwin targets + lipo need the macOS toolchain → macos runner.
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust toolchain + apple targets
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version && cargo --version
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/native/macos-seatbelt-spawn/target
+          key: cargo-mac-${{ hashFiles('src/native/macos-seatbelt-spawn/Cargo.lock') }}
+          restore-keys: cargo-mac-
+
+      - name: Build mac sandbox bin (universal arm64 + x64)
+        run: |
+          M=src/native/macos-seatbelt-spawn/Cargo.toml
+          for tgt in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$tgt" --manifest-path "$M"
+          done
+          mkdir -p out
+          T=src/native/macos-seatbelt-spawn/target
+          lipo -create \
+            "$T/aarch64-apple-darwin/release/vdg-macos-seatbelt-spawn" \
+            "$T/x86_64-apple-darwin/release/vdg-macos-seatbelt-spawn" \
+            -output out/vdg-macos-seatbelt-spawn
+          file out/vdg-macos-seatbelt-spawn
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins-mac
+          path: out/*
+
+  # Release: gather every OS's bins, attach the codex Apache-2.0 LICENSE + NOTICE, write one SHA256SUMS
+  # the consumer verifies, then create the release ONCE (one job → no per-job create race) + upload all.
+  release:
+    needs: [win, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version + tag
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "num=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+
+      - name: Stage release assets + SHA256SUMS
+        shell: bash
+        run: |
+          mkdir -p rel
+          cp dl/bins-win/* rel/
+          cp dl/bins-mac/* rel/
+          cp docs/refs/codex/LICENSE rel/codex-LICENSE.txt
+          cp docs/refs/codex/NOTICE  rel/codex-NOTICE.txt
+          cd rel && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Create release + upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh release create "$TAG" --title "Sandbox bins $TAG" --generate-notes || true
+          gh release upload "$TAG" rel/* --clobber
