@@ -113,10 +113,64 @@ jobs:
           name: bins-mac
           path: out/*
 
+  # Linux: codex's own codex-linux-sandbox (landlock/seccomp) + a static-pie bwrap (musl, zero dynamic
+  # deps → runs on any distro). codex-linux-sandbox links bwrap at runtime. Per the #493 design matrix
+  # (win-x64 / osx-universal / linux-x64), all three platforms publish prebuilt bins.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust toolchain
+        run: rustup default stable && rustc --version && cargo --version
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            docs/refs/codex/codex-rs/target
+          key: cargo-linux-${{ hashFiles('docs/refs/codex/codex-rs/Cargo.lock') }}
+          restore-keys: cargo-linux-
+
+      - name: Build codex-linux-sandbox
+        run: |
+          cd docs/refs/codex/codex-rs
+          cargo build --release -p codex-linux-sandbox
+
+      # static-pie bwrap: musl + --prefer-static + selinux disabled = no dynamic deps. Built in an alpine
+      # container (docker is preinstalled on ubuntu-latest), mirroring build-sandbox.ps1's linux branch.
+      - name: Build static bwrap (alpine/musl)
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD/out:/out" alpine:latest sh -c '
+            set -e
+            apk add --no-cache build-base meson ninja git libcap-dev libcap-static linux-headers
+            git clone --depth 1 https://github.com/containers/bubblewrap /src
+            cd /src
+            meson setup _b --buildtype=release -Dselinux=disabled --prefer-static -Dc_link_args=-static
+            ninja -C _b
+            cp _b/bwrap /out/bwrap && chmod +x /out/bwrap
+            /out/bwrap --version
+          '
+
+      - name: Stage bins
+        run: |
+          cp docs/refs/codex/codex-rs/target/release/codex-linux-sandbox out/codex-linux-sandbox
+          test -f out/codex-linux-sandbox || { echo "MISSING codex-linux-sandbox"; exit 1; }
+          test -f out/bwrap || { echo "MISSING bwrap"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bins-linux
+          path: out/*
+
   # Release: gather every OS's bins, attach the codex Apache-2.0 LICENSE + NOTICE, write one SHA256SUMS
   # the consumer verifies, then create the release ONCE (one job → no per-job create race) + upload all.
   release:
-    needs: [win, mac]
+    needs: [win, mac, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -143,6 +197,7 @@ jobs:
           mkdir -p rel
           cp dl/bins-win/* rel/
           cp dl/bins-mac/* rel/
+          cp dl/bins-linux/* rel/
           cp docs/refs/codex/LICENSE rel/codex-LICENSE.txt
           cp docs/refs/codex/NOTICE  rel/codex-NOTICE.txt
           cd rel && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
