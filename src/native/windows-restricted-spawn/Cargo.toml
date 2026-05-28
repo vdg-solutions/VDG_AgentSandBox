@@ -16,6 +16,7 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 codex-windows-sandbox = { path = "../../../docs/refs/codex/codex-rs/windows-sandbox-rs" }
+codex-protocol = { path = "../../../docs/refs/codex/codex-rs/protocol" }
 
 # Our standalone crate doesn't inherit the codex-rs workspace's [patch] set or its Cargo.lock, so
 # transitive deps re-resolve and diverge. We mirror codex-rs's FULL [patch] (revs copied verbatim from

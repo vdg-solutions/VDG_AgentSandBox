@@ -1,11 +1,10 @@
 // VDG #472-E E-2a — runs a command under codex's non-admin (RestrictedToken) Windows sandbox.
-// Depends on the vendored codex crate via its PUBLIC API (run_windows_sandbox_capture); it does NOT
-// modify any codex source. FS-write is confined to the workspace (WRITE_RESTRICTED token + deny-write
-// ACLs); reads + network are NOT restricted (those need the elevated backend). A C# agent spawns this
-// bin like codex-linux-sandbox.
+// Depends on the vendored codex crate via its PUBLIC API; it does NOT modify any codex source.
+// FS-write is confined to the workspace (WRITE_RESTRICTED token + deny-write ACLs); reads + network
+// are NOT restricted (those need the elevated backend). A C# agent spawns this bin like codex-linux-sandbox.
 //
-// CLI: --policy <preset|json> --sandbox-policy-cwd <dir> [--command-cwd <dir>] [--codex-home <dir>]
-//      [--timeout-ms <n>] -- <command> [args...]
+// CLI: --policy <workspace-write|read-only> --sandbox-policy-cwd <dir> [--command-cwd <dir>]
+//      [--codex-home <dir>] [--timeout-ms <n>] [--elevated] -- <command> [args...]
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
@@ -14,8 +13,10 @@ fn main() -> anyhow::Result<()> {
     use std::path::PathBuf;
 
     use anyhow::{bail, Context};
+    use codex_protocol::models::PermissionProfile;
     use codex_windows_sandbox::{
-        run_windows_sandbox_capture, run_windows_sandbox_capture_elevated, ElevatedSandboxCaptureRequest,
+        run_windows_sandbox_capture, run_windows_sandbox_capture_for_permission_profile_elevated,
+        ElevatedSandboxProfileCaptureRequest,
     };
 
     let args: Vec<String> = std::env::args().collect();
@@ -55,13 +56,21 @@ fn main() -> anyhow::Result<()> {
     let codex_home = codex_home.unwrap_or_else(std::env::temp_dir);
     let env_map: HashMap<String, String> = std::env::vars().collect();
 
+    // codex moved from a policy STRING to a typed PermissionProfile (codex 0db49a7e). codex no longer
+    // parses the string, so map the two presets the agent sends (SandboxManager.cs) to the profile.
+    let profile = match policy.as_str() {
+        "workspace-write" => PermissionProfile::workspace_write(),
+        "read-only" => PermissionProfile::read_only(),
+        other => bail!("unsupported --policy `{other}` (expected `workspace-write` or `read-only`)"),
+    };
+
     // --elevated = full-admin backend: codex internally runs the one-time UAC setup (sandbox user +
     // WFP network filters + ACLs) then spawns the command via codex-command-runner over named-pipe IPC.
     // Default = non-admin RestrictedToken (FS-write only). Both reuse codex Rust; we never port it.
     let result = if elevated {
-        run_windows_sandbox_capture_elevated(ElevatedSandboxCaptureRequest {
-            policy_json_or_preset: &policy,
-            sandbox_policy_cwd: &sandbox_policy_cwd,
+        run_windows_sandbox_capture_for_permission_profile_elevated(ElevatedSandboxProfileCaptureRequest {
+            permission_profile: &profile,
+            permission_profile_cwd: &sandbox_policy_cwd,
             codex_home: &codex_home,
             command,
             cwd: &command_cwd,
@@ -77,7 +86,7 @@ fn main() -> anyhow::Result<()> {
         })?
     } else {
         run_windows_sandbox_capture(
-            &policy,
+            &profile,
             &sandbox_policy_cwd,
             &codex_home,
             command,
